@@ -2,9 +2,20 @@
 # INIT ----
 #+++++++++++++++++++++++++++++
 
+MATCH_ADMSTAT = TRUE
+
+# TODO
+# Un-Comment to remove admission status from match
+#MATCH_ADMSTAT = FALSE
+
 DATADIR='D:\\yehuda\\data\\'
 RESDIR='D:\\yehuda\\results\\'
+if(!MATCH_ADMSTAT){
+  RESDIR='D:\\yehuda\\results-noadmstat\\'
+}
 
+# 2020-12-20 (earliest pcr date in study), 2020-3-12 (first hospitalization date in data)
+STUDY_MAX_PRIOR_HOSP_TO_PCR = 270
 STUDY_MAX_PCR_TO_HOSP = 21
 STUDY_MIN_PCR_TO_HOSP = -2
 STUDY_MAX_PCR_TO_DEATH = 60
@@ -19,10 +30,10 @@ AGE_GROUPS_BREAKS = c(12, 55, 65, Inf)
 AGE_GROUPS_LABELS = c('12-54', '55-64', '65+')
 
 REASONOFDEATHNAME_HEB <- c('לא ידוע', 'נפטר שלילי לקורונה', 'נפטר מסיבה אחרת', 'נפטר כחשוד', 'נפטר מקורונה')
-REASONOFDEATHNAME <- c('unknown', 'negative', 'other', 'suspect', 'positive')
+REASONOFDEATHNAME <- c(NA, 'negative', 'other', 'suspect', 'positive')
 
 MEDICAL_SITUATION_HEB <- c('לא ידוע', 'החלים', 'קל', 'בינוני', 'קשה', 'קריטי', 'נפטר')
-MEDICAL_SITUATION <- c('unknown', 'recovered', 'mild', 'moderate', 'severe', 'critical', 'dead')
+MEDICAL_SITUATION <- c(NA, 'recovered', 'mild', 'moderate', 'severe', 'critical', 'dead')
 
 DIVISIONTYPENAME_HEB = c('רגילה', 'ייעודית')
 DIVISIONTYPENAME = c('stndard', 'dedicated')
@@ -89,26 +100,38 @@ data.master$positive_pcr_before_vaccine <- mapvalues(
 data.master$positive_pcr_no_vaccine <- mapvalues(
   data.master$positive_pcr_no_vaccine, from = c(NA, 'Y'), to = c('0', '1')
 )
-data.master$new_reasonofdeathname <- mapvalues(
-  data.master$new_reasonofdeathname, from = REASONOFDEATHNAME_HEB, to = REASONOFDEATHNAME
+data.master$new_reasonofdeathname <- factor(
+  mapvalues(
+    data.master$new_reasonofdeathname, from = REASONOFDEATHNAME_HEB, to = REASONOFDEATHNAME
+    ),
+  levels = REASONOFDEATHNAME
 )
 
 ## monitoring ----
 #.............................
 
-data.monitoring$first_update_medical_situation <- mapvalues(
-  data.monitoring$first_update_medical_situation, from = MEDICAL_SITUATION_HEB, to = MEDICAL_SITUATION
+data.monitoring$first_update_medical_situation <- factor(
+  mapvalues(
+    data.monitoring$first_update_medical_situation, from = MEDICAL_SITUATION_HEB, to = MEDICAL_SITUATION
+  ),
+  levels = MEDICAL_SITUATION
 )
 
-data.monitoring$last_update_medical_situation <- mapvalues(
-  data.monitoring$last_update_medical_situation, from = MEDICAL_SITUATION_HEB, to = MEDICAL_SITUATION
+data.monitoring$last_update_medical_situation <- factor(
+  mapvalues(
+    data.monitoring$last_update_medical_situation, from = MEDICAL_SITUATION_HEB, to = MEDICAL_SITUATION
+  ),
+  levels = MEDICAL_SITUATION
 )
 
 ## hospitalizations ----
 #.............................
 
-data.hospitalizations$new_divisiontypename <- mapvalues(
-  data.hospitalizations$new_divisiontypename, from = DIVISIONTYPENAME_HEB, to = DIVISIONTYPENAME
+data.hospitalizations$new_divisiontypename <- factor(
+  mapvalues(
+    data.hospitalizations$new_divisiontypename, from = DIVISIONTYPENAME_HEB, to = DIVISIONTYPENAME
+  ),
+  levels = DIVISIONTYPENAME
 )
 
 # SET TYPES ----
@@ -166,14 +189,13 @@ data.quarantine$err <- ''
 #.............................
 
 data.master <- data.master %>%
-# Set err if duplicate patient id in master table
+# Set err if duplicate patient_id and first_positive_result_test_date in master table
   mutate(
     err = case_when(
-      (patient_id %in% patient_id[duplicated(patient_id)]) ~ paste0(err, ' duplicated'),
+      (patient_id %in% patient_id[duplicated(cbind(patient_id, first_positive_result_test_date))]) ~ paste0(err, ' duplicated_id_pcr+'),
       TRUE ~ err
     )
   ) %>%
-  # Add error if no patient_id
   mutate(
     err = case_when(
       is.na(patient_id) ~ paste0(err, ' no_patient_id'),
@@ -198,6 +220,14 @@ data.master <- data.master %>%
   mutate(
     err = case_when(
       is.na(new_birthdate) ~ paste0(err, ' no_new_birthdate'),
+      TRUE ~ err
+    )
+  ) %>%
+  # Add error if no new_deathdate
+  mutate(
+    err = case_when(
+      ind_death == '1' & !patient_id %in% filter(data.hospitalizations, !is.na(data.hospitalizations$new_deathdate))$patient_id ~ 
+        paste0(err, ' no_new_deathdate'),
       TRUE ~ err
     )
   )
@@ -253,8 +283,15 @@ data.hospitalizations <- data.hospitalizations %>%
 ## master ----
 #.............................
 
-data.comb <- data.master %>% filter(err == '') %>% select(-err)
-
+# Get all rows without errors and take the first first_positive_result_test_date for each patient
+data.comb <- data.master %>%
+  group_by(patient_id) %>%
+  arrange(first_positive_result_test_date) %>%
+  slice(1L) %>%
+  filter(err == '') %>%
+  select(-err)
+  
+  
 ## death dates ----
 #.............................
 
@@ -297,6 +334,54 @@ tmp.hospitalizations <- data.hospitalizations %>%
   filter(
     between(as.numeric(difftime(new_arrivaldate, first_positive_result_test_date, units = 'days')), STUDY_MIN_PCR_TO_HOSP, STUDY_MAX_PCR_TO_HOSP) &
       (is.na(new_releasedate) | first_positive_result_test_date <= new_releasedate)
+  )
+
+## prior hospitalization for estimate co-morbidity ----
+#.............................
+
+# generate table with non covid hospitalization and first PCR
+prior.hospitalizations <- data.hospitalizations %>% 
+  # leave only standard hospitalization (non-covid)
+  filter(new_divisiontypename == 'stndard') %>%
+  merge(data.comb[, c('patient_id', 'first_positive_result_test_date')], by = 'patient_id', all = FALSE) %>%
+  mutate(
+    days_between_pcr_to_prior_hosp = as.numeric(first_positive_result_test_date - new_arrivaldate)
+  ) %>%
+  #leave only hospitalization heppend between 2 to STUDY_MAX_PRIOR_HOSP_TO_PCR days earlier 
+  filter(days_between_pcr_to_prior_hosp > 1) %>%
+  filter(days_between_pcr_to_prior_hosp < STUDY_MAX_PRIOR_HOSP_TO_PCR) %>% 
+  # calculate hospitalization duration before PCR
+  mutate(
+    prior_pcr_hospitalization_duration = case_when(
+      new_releasedate >= first_positive_result_test_date ~ days_between_pcr_to_prior_hosp,
+      new_releasedate < first_positive_result_test_date ~ duration_hospitalization
+    )
+  ) %>%
+  # add indication column does covid diagnosis heppend during non 
+  mutate(
+    PCR_during_hospitalization_ind = case_when(
+      new_releasedate >= first_positive_result_test_date ~ "1",
+      new_releasedate < first_positive_result_test_date ~ "0"
+    )
+  ) %>%
+  # select relevant columns to add to data.comb
+  select(patient_id,days_between_pcr_to_prior_hosp,prior_pcr_hospitalization_duration,PCR_during_hospitalization_ind)
+
+
+# Error if there are double stndard hospitalization for same patient
+if(nrow(data.frame(table(prior.hospitalizations$patient_id))%>%filter(Freq>1)) > 0){
+  stop("there are double prior hospitalization for same patient")
+}
+
+# Add prior_pcr_hospitalization_duration to data.comb
+data.comb <- data.comb %>%
+  merge(prior.hospitalizations, by = 'patient_id', all.x = TRUE, all.y = FALSE) %>%
+  # Update all NA (not hospitalized) to 0
+  mutate(
+    PCR_during_hospitalization_ind = as.factor(case_when(
+      is.na(PCR_during_hospitalization_ind) ~ '0',
+      TRUE ~ PCR_during_hospitalization_ind
+    ))
   )
 
 ## hospitalization indication ----
@@ -374,6 +459,103 @@ tmp.hospitalizations.first <- tmp.hospitalizations %>%
 data.comb <- data.comb %>%
   merge(tmp.hospitalizations.first, by = 'patient_id', all.x = TRUE, all.y = FALSE)
 
+## hospitalization monitoring ----
+#.............................
+
+# Generate table with relevant first_update_medical_situation
+tmp.first_update_medical_situation <- data.monitoring %>%
+  # Rename columns
+  rename(
+    update_medical_situation = first_update_medical_situation,
+    datemonitoring = first_datemonitoring
+  ) %>%
+  # Select the relevant columns
+  dplyr::select(c('patient_id', 'update_medical_situation', 'datemonitoring'))
+
+# Generate table with relevant first_update_medical_situation
+tmp.last_update_medical_situation <- data.monitoring %>%
+  # Rename columns
+  rename(
+    update_medical_situation = last_update_medical_situation,
+    datemonitoring = last_datemonitoring
+  ) %>%
+  # Select the relevant columns
+  dplyr::select(c('patient_id', 'update_medical_situation', 'datemonitoring'))
+  
+# Generate table with relevant first_update_medical_situation
+tmp.monitoring <- data.comb %>%
+  # Select the relevant columns
+  dplyr::select(c('patient_id', 'new_arrivaldate_first', 'duration_hospitalization')) %>%
+  # Remove incomplete cases
+  drop_na() %>%
+  # Get first_update_medical_situation from monitoring table.
+  merge(rbind(tmp.first_update_medical_situation, tmp.last_update_medical_situation), by = 'patient_id', all = FALSE) %>%
+  # Remove incomplete cases
+  drop_na() %>%
+  # Leave only monitoring during hospitalization
+  filter(
+    0 <= difftime(datemonitoring, new_arrivaldate_first, units = 'days') &
+    difftime(datemonitoring, new_arrivaldate_first, units = 'days') <= duration_hospitalization
+  )
+
+# Generate table with min update_medical_situation
+tmp.min_update_medical_situation <- tmp.monitoring %>%
+  # Get the min first_update_medical_situation for each patient
+  group_by(patient_id) %>%
+  arrange(update_medical_situation) %>%
+  slice(1L) %>%
+  rename(min_update_medical_situation = update_medical_situation) %>%
+  dplyr::select(-datemonitoring, -new_arrivaldate_first, -duration_hospitalization)
+
+# Add new_arrivaldate_first to data.comb
+data.comb <- data.comb %>%
+  merge(tmp.min_update_medical_situation, by = 'patient_id', all.x = TRUE, all.y = FALSE) %>%
+  mutate(min_update_medical_situation = factor(case_when(
+    !is.na(min_update_medical_situation) ~ as.character(min_update_medical_situation),
+    ind_hospitalized == '1' ~ 'unknown',
+    ind_hospitalized == '0' ~ 'not_hospitalized',
+    TRUE ~ 'hospitalization_unknown'
+  ), levels = c('hospitalization_unknown', 'not_hospitalized', 'unknown', na.omit(MEDICAL_SITUATION))))
+
+# Generate table with max update_medical_situation
+tmp.max_update_medical_situation <- tmp.monitoring %>%
+  # Get the max first_update_medical_situation for each patient
+  group_by(patient_id) %>%
+  arrange(desc(update_medical_situation)) %>%
+  slice(1L) %>%
+  rename(max_update_medical_situation = update_medical_situation) %>%
+  dplyr::select(-datemonitoring, -new_arrivaldate_first, -duration_hospitalization)
+
+# Add new_arrivaldate_first to data.comb
+data.comb <- data.comb %>%
+  merge(tmp.max_update_medical_situation, by = 'patient_id', all.x = TRUE, all.y = FALSE) %>%
+  mutate(max_update_medical_situation = factor(case_when(
+    !is.na(max_update_medical_situation) ~ as.character(max_update_medical_situation),
+    ind_hospitalized == '1' ~ 'unknown',
+    ind_hospitalized == '0' ~ 'not_hospitalized',
+    TRUE ~ 'hospitalization_unknown'
+  ), levels = c('hospitalization_unknown', 'not_hospitalized', 'unknown', na.omit(MEDICAL_SITUATION))))
+
+# Generate table with max update_medical_situation
+tmp.first_covid_update_medical_situation <- tmp.monitoring %>%
+  # Get the max first_update_medical_situation for each patient
+  group_by(patient_id) %>%
+  arrange(datemonitoring) %>%
+  slice(1L) %>%
+  rename(first_covid_update_medical_situation = update_medical_situation) %>%
+  dplyr::select(-datemonitoring, -new_arrivaldate_first, -duration_hospitalization)
+
+# Add new_arrivaldate_first to data.comb
+data.comb <- data.comb %>%
+  merge(tmp.first_covid_update_medical_situation, by = 'patient_id', all.x = TRUE, all.y = FALSE) %>%
+  mutate(first_covid_update_medical_situation = factor(case_when(
+    !is.na(first_covid_update_medical_situation) ~ as.character(first_covid_update_medical_situation),
+    ind_hospitalized == '1' ~ 'unknown',
+    ind_hospitalized == '0' ~ 'not_hospitalized',
+    TRUE ~ 'hospitalization_unknown'
+  ), levels = c('hospitalization_unknown', 'not_hospitalized', 'unknown', na.omit(MEDICAL_SITUATION))))
+
+
 ## Add columns ----
 #.............................
 
@@ -425,20 +607,54 @@ data.comb <- data.comb %>%
 study.pre.match <- data.comb %>%
   # Leave only complete cases or control
   drop_na(case, age_group, gender, first_positive_result_test_date) %>%
+  # Remove cases with no deathdate
+  filter(!(ind_death == '1' & is.na(new_deathdate))) %>%
   # Leave only cases with positive pcr during study period
   filter(between(first_positive_result_test_date, as.Date(STUDY_START), as.Date(STUDY_END))) %>%
   # Leave only patients aged STUDY_MIN_AGE and above
-  filter(STUDY_MIN_AGE <= age)
+  filter(STUDY_MIN_AGE <= age) %>%
+  # TODO ASK Remove
+  # Filter PCR_during_hospitalization_ind
+  filter(PCR_during_hospitalization_ind == "0") %>%
+  # filter all error in hospitaliztion indicate as -1 or hospitalization_unknown
+  # since anyway all of them in the control group and it make love plot
+  # without this parameter that look better (n=10)
+  filter(first_covid_update_medical_situation != "hospitalization_unknown")
+
 
 # Do match
-study.matched <- matchit(
-  case ~ age_group_narrow + gender + age + first_positive_result_test_date,
-  data = study.pre.match, method = 'nearest', ratio = 1, exact = c("age_group_narrow", "gender")
-)
+# NOTE: With first_covid_update_medical_situation there is no difference in hospitalizaton
+if(MATCH_ADMSTAT){
+  study.matched <- matchit(
+    case ~ age + first_positive_result_test_date,
+    data = study.pre.match, method = 'nearest', ratio = 1, exact = c("age_group_narrow", "gender", "first_covid_update_medical_situation")
+  )
+} else {
+  study.matched <- matchit(
+    case ~ age + first_positive_result_test_date,
+    data = study.pre.match, method = 'nearest', ratio = 1, exact = c("age_group_narrow", "gender")
+  )
+}
 
 # Make study table
 study <- match.data(study.matched) %>%
-  arrange(desc(case), age, gender)
+  arrange(desc(case), age, gender) 
+
+tmp.study <- study %>%
+  select(patient_id,new_birthdate,gendercodename,ind_death,new_reasonofdeathname,gender
+         ,new_deathdate,days_between_pcr_to_prior_hosp, prior_pcr_hospitalization_duration,
+         PCR_during_hospitalization_ind, ind_hospitalized, duration_hospitalization, 
+         new_arrivaldate_first,age, case)
+
+# Make study table for hospitalization analysis
+study.hosp <- study %>%
+  # Remove unknow hospitalization status
+  filter(ind_hospitalized %in% c('0', '1')) %>%
+  # Leave only matched rows
+  filter(subclass %in% filter(data.frame(table(.$subclass)), Freq == 2)$Var1) %>%
+  # drop unused levels from factors after filterin
+  {data.frame(lapply(., function(x) if(is.factor(x)) droplevels(x) else x))}
+
 
 # ANALYSIS ----
 #+++++++++++++++++++++++++++++
@@ -453,17 +669,21 @@ plt.covariate <- love.plot(
   var.names = data.frame(
     old=c(
       paste("age_group_narrow_",levels(study.pre.match$age_group_narrow),sep=""),
+      paste("first_covid_update_medical_situation_",levels(study.pre.match$first_covid_update_medical_situation),sep=""),
       'gender_male',
       'gender_female',
       'age',
       'first_positive_result_test_date'
+      
     ),
     new=c(
       levels(study.pre.match$age_group_narrow),
+      levels(study.pre.match$first_covid_update_medical_situation),
       'Gender',
       'Gender',
       'Age',
       'PCR-positive\n result date'
+      
     )
   ),
   thresholds = 0.1
@@ -546,8 +766,42 @@ plt.days_first_positive_result_to_hospitalization_study <- study %>%
       facet_grid(case ~ .) +
       theme(strip.text.y =element_blank())}
 
+# # compare distribiutens of first situation in hospitalization between patient diagnosed in hospital compare to previusely diagnosed  
+# plt.first_situation_in_hospitalization <- study %>%
+#   mutate(
+#     # Add different group (-2 to 0 and 1-21) indication column
+#     case = as.factor(case_when(
+#       days_first_positive_result_to_hospitalization > '1' ~ '1',
+#       days_first_positive_result_to_hospitalization < '0' ~ '0'))) %>%
+  
+
+
 ## Death ----
 #.............................
+
+# Function to create table for death analysis 
+summarise_death <- function(df){
+  return(
+    df %>%
+      dplyr::summarise(
+        case.n=sum(case=='1'),
+        control.n=sum(case=='0'),
+        case.death.n=sum(case=='1' & ind_death=='1'),
+        control.death.n=sum(case=='0' & ind_death=='1'),
+        case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
+        control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
+        fisher.test.p.value=fisher.test(case, ind_death)$p.value,
+        fisher.test.or=fisher.test(case, ind_death)$estimate,
+        fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
+        mcnemar.test.p.value=mcnemar.test(table(select(merge(
+          filter(data.frame(case = case, ind_death = ind_death, subclass = subclass), case == "1"),
+          filter(data.frame(case = case, ind_death = ind_death, subclass = subclass), case == "0"),
+          by = "subclass",
+          suffixes = c(".case", ".control")
+        ), ind_death.case, ind_death.control)))$p.value,
+        .groups = 'drop')
+  )
+}
 
 # Here we test she correlation between vaccination and the probability to die from corona
 
@@ -556,86 +810,84 @@ anl.death <- bind_rows(
   # Narrow age group
   study %>%
     mutate(description='Narrow age group', age_group=age_group_narrow) %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-    .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_death(),
   
   # Wider age group
   study %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_death(),
   
   # Wider age group no gender
   study %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group) %>%
+    summarise_death(),
   
   # Aged 55 and above by gender
   study %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, gender) %>%
+    summarise_death(),
   
   # Aged 55 and above
   study %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description) %>%
+    summarise_death(),
+  
+  # Aged 55 and above first_covid_update_medical_situation
+  study %>%
+    # Leave only patient Aged 55 and above
+    filter(age >= 55) %>%
+    mutate(description='Patient aged 55 and above status at admission') %>%
+    group_by(description, first_covid_update_medical_situation) %>%
+    summarise_death(),
+  
+  study %>%
+    mutate(first_covid_update_medical_situation=factor(case_when(
+      first_covid_update_medical_situation == 'severe' ~ 'severe_critical',
+      first_covid_update_medical_situation == 'critical' ~ 'severe_critical',
+      TRUE ~ as.character(first_covid_update_medical_situation)
+    ))) %>%
+    filter(first_covid_update_medical_situation == 'severe_critical') %>%
+    # Leave only patient Aged 55 and above
+    filter(age >= 55) %>%
+    mutate(description='Patient aged 55 and above status at admission') %>%
+    group_by(description, first_covid_update_medical_situation) %>%
+    summarise_death(),
+  
+  study %>%
+    mutate(first_covid_update_medical_situation=factor(case_when(
+      first_covid_update_medical_situation == 'moderate' ~ 'moderate_severe',
+      first_covid_update_medical_situation == 'severe' ~ 'moderate_severe',
+      TRUE ~ as.character(first_covid_update_medical_situation)
+    ))) %>%
+    filter(first_covid_update_medical_situation == 'moderate_severe') %>%
+    # Leave only patient Aged 55 and above
+    filter(age >= 55) %>%
+    mutate(description='Patient aged 55 and above status at admission') %>%
+    group_by(description, first_covid_update_medical_situation) %>%
+    summarise_death(),
+  
+  study %>%
+    mutate(first_covid_update_medical_situation=factor(case_when(
+      first_covid_update_medical_situation == 'moderate' ~ 'moderate_severe_critical',
+      first_covid_update_medical_situation == 'severe' ~ 'moderate_severe_critical',
+      first_covid_update_medical_situation == 'critical' ~ 'moderate_severe_critical',
+      TRUE ~ as.character(first_covid_update_medical_situation)
+    ))) %>%
+    filter(first_covid_update_medical_situation == 'moderate_severe_critical') %>%
+    # Leave only patient Aged 55 and above
+    filter(age >= 55) %>%
+    mutate(description='Patient aged 55 and above status at admission') %>%
+    group_by(description, first_covid_update_medical_situation) %>%
+    summarise_death(),
 )
 
 anl.death$description <- as.factor(anl.death$description)
@@ -660,86 +912,36 @@ anl.death2d <- bind_rows(
   # Narrow age group
   study.2d %>%
     mutate(description='Narrow age group', age_group=age_group_narrow) %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_death(),
   
   # Wider age group
   study.2d %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_death(),
   
   # Wider age group no gender
   study.2d %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group) %>%
+    summarise_death(),
   
   # Aged 55 and above by gender
   study.2d %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, gender) %>%
+    summarise_death(),
   
   # Aged 55 and above
   study.2d %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop')
+    group_by(description) %>%
+    summarise_death(),
 )
 
 anl.death2d$description <- as.factor(anl.death2d$description)
@@ -764,86 +966,36 @@ anl.death2t5d <- bind_rows(
   # Narrow age group
   study.2t5d %>%
     mutate(description='Narrow age group', age_group=age_group_narrow) %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_death(),
   
   # Wider age group
   study.2t5d %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_death(),
   
   # Wider age group no gender
   study.2t5d %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group) %>%
+    summarise_death(),
   
   # Aged 55 and above by gender
   study.2t5d %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, gender) %>%
+    summarise_death(),
   
   # Aged 55 and above
   study.2t5d %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.death.n=sum(case=='1' & ind_death=='1'),
-      control.death.n=sum(case=='0' & ind_death=='1'),
-      case.death.p=sum(case=='1' & ind_death=='1')/sum(case=='1'),
-      control.death.p=sum(case=='0' & ind_death=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, ind_death)$p.value,
-      fisher.test.or=fisher.test(case, ind_death)$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, ind_death)$conf.int, collapse = '-'),
-      .groups = 'drop')
+    group_by(description) %>%
+    summarise_death(),
 )
 
 anl.death2t5d$description <- as.factor(anl.death2t5d$description)
@@ -852,7 +1004,7 @@ anl.death2t5d$description <- as.factor(anl.death2t5d$description)
 #.............................
 
 # Make data for survival analysis to cutoff time
-# Make sure nrow(study %>% filter(ind_death == '1' & is.na(new_deathdate))) == 0
+# Make sure nrow(study %>% filter(ind_death == '1' & is.na(new_deathdate))) == 0 - filtered in study.pre.match
 
 study.survival <- study %>%
   mutate(
@@ -872,14 +1024,14 @@ study.survival <- study %>%
 
 plt.survival <- study.survival %>%
   {ggsurvplot(
-    fit = survfit(
+    fit=survfit(
       Surv(days_first_positive_result_to_death, ind_death) ~ case,
       data= .,
       se.fit=TRUE,
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -887,13 +1039,15 @@ plt.survival <- study.survival %>%
     table.heigth=.45,
     tables.theme = theme_cleantable(),
     pval=TRUE,
-    pval.coord = c(1,0.65),
-    ylim=c(0.6,1.01),
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10,
-    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5)
+    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5),
+    risk.table.fontsize = 2.8
+    
   )}
 
 # Aged 55 and above
@@ -909,7 +1063,7 @@ plt.survival55p <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -917,13 +1071,14 @@ plt.survival55p <- study.survival %>%
     table.heigth=.45,
     tables.theme = theme_cleantable(),
     pval=TRUE,
-    pval.coord = c(1,0.65),
-    ylim=c(0.6,1.01),
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10,
-    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5)
+    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5),
+    risk.table.fontsize = 3.5
   )}
 
 # Aged 65 and above
@@ -939,7 +1094,7 @@ plt.survival65p <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -947,13 +1102,14 @@ plt.survival65p <- study.survival %>%
     table.heigth=.45,
     tables.theme = theme_cleantable(),
     pval=TRUE,
-    pval.coord = c(1,0.65),
-    ylim=c(0.6,1.01),
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10,
-    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5)
+    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5),
+    risk.table.fontsize = 3.5
   )}
 
 # Aged 55 - 65
@@ -969,7 +1125,7 @@ plt.survival55_65 <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -977,13 +1133,14 @@ plt.survival55_65 <- study.survival %>%
     table.heigth=.45,
     tables.theme = theme_cleantable(),
     pval=TRUE,
-    pval.coord = c(1,0.65),
-    ylim=c(0.6,1.01),
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10,
-    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5)
+    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5),
+    risk.table.fontsize = 3.5
   )}
 
 # By groups + gender
@@ -1000,18 +1157,22 @@ plt.survival_ngrp_gen <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    #pval.coord = c(1,0.65),
-    #ylim=c(0.6,1.01),
+    pval.coord = c(1,0.5),
+    ylim=c(0.4,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10,
-    labeller = c(c("gender: female"), c("a"))
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+    labeller = c(c("gender: female"), c("a")),
+    panel.labs = list(gender = c("Female","Male"),
+                      age_group_narrow = c("12-34", "35-44", "45-54", "55-64", "65-74", "75-84", "85+"))
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.background.y = element_rect(color = "white"),
+            strip.text = element_text(size = 12), plot.margin = margin(20, 20, 20, 20))}
 
 plt.survival_wgrp_gen <- study.survival %>%
   mutate(age_group=factor(.$age_group, levels = levels(.$age_group), labels = sub("^(.*)", "Age group: \\1", levels(.$age_group)))) %>%
@@ -1025,17 +1186,19 @@ plt.survival_wgrp_gen <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    pval.coord = c(1,0.65),
-    ylim=c(0.6,1.01),
+    pval.coord = c(1,0.75),
+    ylim=c(0.7,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
-    break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+    break.time.by = 10,
+    panel.labs = list(gender = c("Female","Male"))
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12), strip.background.y = element_rect(color = "white"), plot.margin = margin(20, 20, 20, 20))}
 
 # By groups
 
@@ -1051,17 +1214,18 @@ plt.survival_ngrp <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    # pval.coord = c(1,0.65),
-    #ylim=c(0.6,1.01),
+    pval.coord = c(1,0.65),
+    ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12), plot.margin = margin(20, 20, 20, 20))}
 
 plt.survival_wgrp <- study.survival %>%
   mutate(age_group=factor(.$age_group, levels = levels(.$age_group), labels = sub("^(.*)", "Age group: \\1", levels(.$age_group)))) %>%
@@ -1076,17 +1240,93 @@ plt.survival_wgrp <- study.survival %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    pval.coord = c(1,0.65),
-    ylim=c(0.6,1.01),
+    pval.coord = c(1,0.81),
+    ylim=c(0.8,1.01),
     axes.offset = FALSE,
     xlab = "Days since positive PCR",
     ylab = "Survival probability",
     break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+  ) +  theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+             strip.text = element_text(size = 12), plot.margin = margin(20, 20, 20, 20))}
+
+
+# Aged 55 and above by first_covid_update_medical_situation
+
+plt.survival55p_situation <- study.survival %>%
+  # TODO ASK if combine conditions 
+  # mutate(first_covid_update_medical_situation=factor(case_when(
+  #   first_covid_update_medical_situation == 'moderate' ~ 'moderate_severe_critical',
+  #   first_covid_update_medical_situation == 'severe' ~ 'moderate_severe_critical',
+  #   first_covid_update_medical_situation == 'critical' ~ 'moderate_severe_critical',
+  #   TRUE ~ as.character(first_covid_update_medical_situation)
+  # ))) %>%
+  # Leave only patient Aged 55 and above
+  filter(age >= 55) %>%
+  # drop unused levels from factors after filterin
+  {data.frame(lapply(., function(x) if(is.factor(x)) droplevels(x) else x))} %>%
+  {ggsurvplot_facet(
+    # ncol = 1,
+    short.panel.labs = TRUE,
+    facet.by = c('first_covid_update_medical_situation'),
+    fit = survfit(
+      Surv(days_first_positive_result_to_death, ind_death) ~ case,
+      data= .,
+      se.fit=TRUE,
+      conf.int=.95
+    ),
+    data= .,
+    #palette=c("black","darkred"),
+    legend.title = "",
+    legend.labs = c("Unvaccinated", "Recently injected"),
+    pval=TRUE,
+    # TODO
+    # pval.coord = c(1,0.65),
+    # ylim=c(0.6,1.01),
+    axes.offset = FALSE,
+    xlab = "Days since positive PCR",
+    ylab = "Survival probability",
+    break.time.by = 10,
+    panel.labs = list(first_covid_update_medical_situation = c("Not hospitalized",
+                                                               "Unknown", "Mild", "Moderate",'Severe','Critical', "Dead")),
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12), plot.margin = margin(20, 20, 20, 20))}
+
+
+# Aged 55 and above only mild
+plt.survival55p_mild <- study.survival %>%
+  # Leave only patient Aged 55 and above
+  filter(age >= 55) %>%
+  filter(first_covid_update_medical_situation == "mild") %>%
+  {ggsurvplot(
+    fit=survfit(
+      Surv(days_first_positive_result_to_death, ind_death) ~ case,
+      data=  .,
+      se.fit=TRUE,
+      conf.int=.95
+    ),
+    data= .,
+    #palette=c("black","darkred"),
+    legend.title = "",
+    legend.labs = c("Unvaccinated", "Recently injected"),
+    risk.table = TRUE,
+    risk.table.title = "No. at Risk",
+    table.heigth=.45,
+    tables.theme = theme_cleantable(),
+    pval=TRUE,
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
+    axes.offset = FALSE,
+    xlab = "Days since positive PCR",
+    ylab = "Survival probability",
+    break.time.by = 10,
+    xlim = c(0, STUDY_MAX_PCR_TO_DEATH - STUDY_MIN_TO_DEATH + 5),
+    risk.table.fontsize = 3.5
+  )}
+
 
 ## Hospitalization kaplan meier ----
 #.............................
@@ -1094,7 +1334,7 @@ plt.survival_wgrp <- study.survival %>%
 # Make data for kaplan meier analysis to cutoff time
 # Make sure nrow(study %>% filter(ind_hospitalized == '1' & is.na(new_arrivaldate_first))) == 0
 
-study.hosp_km <- study %>%
+study.hosp_km <- study.hosp %>%
   mutate(
     ind_hospitalized = as.numeric(case_when(
       days_first_positive_result_to_hospitalization > STUDY_MAX_PCR_TO_HOSP ~ '0',
@@ -1119,7 +1359,7 @@ plt.hosp_km <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -1131,7 +1371,7 @@ plt.hosp_km <- study.hosp_km %>%
     ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
+    ylab = "1-hospitalization probability",
     #break.time.by = 10,
     xlim = c(0, STUDY_MAX_PCR_TO_HOSP - STUDY_MIN_PCR_TO_HOSP + 1)
   )}
@@ -1149,7 +1389,7 @@ plt.hosp_km55p <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -1161,7 +1401,7 @@ plt.hosp_km55p <- study.hosp_km %>%
     ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
+    ylab = "1-hospitalization probability",
     #break.time.by = 10,
     xlim = c(0, STUDY_MAX_PCR_TO_HOSP - STUDY_MIN_PCR_TO_HOSP + 1)
   )}
@@ -1179,7 +1419,7 @@ plt.hosp_km65p <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -1191,7 +1431,7 @@ plt.hosp_km65p <- study.hosp_km %>%
     ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
+    ylab = "1-hospitalization probability",
     #break.time.by = 10,
     xlim = c(0, STUDY_MAX_PCR_TO_HOSP - STUDY_MIN_PCR_TO_HOSP + 1)
   )}
@@ -1209,7 +1449,7 @@ plt.hosp_km55_65 <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     risk.table = TRUE,
@@ -1221,7 +1461,7 @@ plt.hosp_km55_65 <- study.hosp_km %>%
     ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
+    ylab = "1-hospitalization probability",
     #break.time.by = 10,
     xlim = c(0, STUDY_MAX_PCR_TO_HOSP - STUDY_MIN_PCR_TO_HOSP + 1)
   )}
@@ -1240,7 +1480,7 @@ plt.hosp_km_ngrp_gen <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
@@ -1248,9 +1488,13 @@ plt.hosp_km_ngrp_gen <- study.hosp_km %>%
     #ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
-    break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+    ylab = "1-hospitalization probability",
+    break.time.by = 10,
+    panel.labs = list(gender = c("Female","Male"),
+                      age_group_narrow = c("12-34", "35-44", "45-54", "55-64", "65-74", "75-84", "85+"))
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12), strip.background.y = element_rect(color = "white"),
+            plot.margin = margin(20, 20, 20, 20))}
 
 plt.hosp_km_wgrp_gen <- study.hosp_km %>%
   mutate(age_group=factor(.$age_group, levels = levels(.$age_group), labels = sub("^(.*)", "Age group: \\1", levels(.$age_group)))) %>%
@@ -1264,17 +1508,20 @@ plt.hosp_km_wgrp_gen <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    #pval.coord = c(1,0.65),
-    #ylim=c(0.6,1.01),
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
-    break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+    ylab = "1-hospitalization probability",
+    break.time.by = 10,
+    panel.labs = list(gender = c("Female","Male"))
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12), strip.background.y = element_rect(color = "white"),
+            plot.margin = margin(20, 20, 20, 20))}
 
 # By groups
 
@@ -1290,17 +1537,19 @@ plt.hosp_km_ngrp <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    #pval.coord = c(1,0.65),
-    #ylim=c(0.6,1.01),
+    pval.coord = c(1,0.55),
+    ylim=c(0.5,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
+    ylab = "1-hospitalization probability",
     break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12),
+            plot.margin = margin(20, 20, 20, 20))}
 
 plt.hosp_km_wgrp <- study.hosp_km %>%
   mutate(age_group=factor(.$age_group, levels = levels(.$age_group), labels = sub("^(.*)", "Age group: \\1", levels(.$age_group)))) %>%
@@ -1315,128 +1564,94 @@ plt.hosp_km_wgrp <- study.hosp_km %>%
       conf.int=.95
     ),
     data= .,
-    palette=c("black","darkred"),
+    #palette=c("black","darkred"),
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    #pval.coord = c(1,0.65),
-    #ylim=c(0.6,1.01),
+    pval.coord = c(1,0.65),
+    ylim=c(0.6,1.01),
     axes.offset = FALSE,
     xlab = "Days since 2-days before positive PCR",
-    ylab = "Hospitalization probability",
+    ylab = "1-hospitalization probability",
     break.time.by = 10
-  ) + theme(panel.spacing = unit(1, "lines"), plot.margin = margin(20, 20, 20, 20))}
+  ) + theme(panel.spacing = unit(1, "lines"),strip.background.x = element_rect(color = "white"),
+            strip.text = element_text(size = 12),
+            plot.margin = margin(20, 20, 20, 20))}
 
 ## Hospitalization ----
 #.............................
+
+# Function to create table for death analysis 
+summarise_hosp <- function(df){
+  return(
+    df %>%
+      dplyr::summarise(
+        case.n=sum(case=='1'),
+        control.n=sum(case=='0'),
+        case.hosp.n=sum(case=='1' & ind_hospitalized=='1'),
+        control.hosp.n=sum(case=='0' & ind_hospitalized=='1'),
+        case.hosp.p=sum(case=='1' & ind_hospitalized=='1')/sum(case=='1'),
+        control.hosp.p=sum(case=='0' & ind_hospitalized=='1')/sum(case=='0'),
+        fisher.test.p.value=fisher.test(case, as.character(ind_hospitalized))$p.value,
+        fisher.test.or=fisher.test(case, as.character(ind_hospitalized))$estimate,
+        fisher.test.conf.int=paste(fisher.test(case, as.character(ind_hospitalized))$conf.int, collapse = '-'),
+        mcnemar.test.p.value=mcnemar.test(table(select(merge(
+          filter(data.frame(case = case, ind_hospitalized = ind_hospitalized, subclass = subclass), case == "1"),
+          filter(data.frame(case = case, ind_hospitalized = ind_hospitalized, subclass = subclass), case == "0"),
+          by = "subclass",
+          suffixes = c(".case", ".control")
+        ), ind_hospitalized.case, ind_hospitalized.control)))$p.value,
+        .groups = 'drop')
+  )
+}
 
 # Here we test the correlation between vaccination and the probability to hospitalize in corona dedicated division
 
 anl.hosp <- bind_rows(
   
   # Narrow age group
-  study %>%
-    # Remove unknow hospitalization status
-    filter(ind_hospitalized %in% c('0', '1')) %>%
+  study.hosp %>%
     # Update ind_hospitalized as factor
-    mutate(ind_hospitalized = as.factor(ind_hospitalized)) %>%
+    mutate(ind_hospitalized = factor(ind_hospitalized)) %>%
     mutate(description='Narrow age group', age_group=age_group_narrow) %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.hosp.n=sum(case=='1' & ind_hospitalized=='1'),
-      control.hosp.n=sum(case=='0' & ind_hospitalized=='1'),
-      case.hosp.p=sum(case=='1' & ind_hospitalized=='1')/sum(case=='1'),
-      control.hosp.p=sum(case=='0' & ind_hospitalized=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, as.character(ind_hospitalized))$p.value,
-      fisher.test.or=fisher.test(case, as.character(ind_hospitalized))$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, as.character(ind_hospitalized))$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_hosp(),
   
   # Wider age group
-  study %>%
-    # Remove unknow hospitalization status
-    filter(ind_hospitalized %in% c('0', '1')) %>%
+  study.hosp %>%
     # Update ind_hospitalized as factor
-    mutate(ind_hospitalized = as.factor(ind_hospitalized)) %>%
+    mutate(ind_hospitalized = factor(ind_hospitalized)) %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.hosp.n=sum(case=='1' & ind_hospitalized=='1'),
-      control.hosp.n=sum(case=='0' & ind_hospitalized=='1'),
-      case.hosp.p=sum(case=='1' & ind_hospitalized=='1')/sum(case=='1'),
-      control.hosp.p=sum(case=='0' & ind_hospitalized=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, as.character(ind_hospitalized))$p.value,
-      fisher.test.or=fisher.test(case, as.character(ind_hospitalized))$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, as.character(ind_hospitalized))$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group, gender) %>%
+    summarise_hosp(),
   
   # Wider age group no gender
-  study %>%
-    # Remove unknow hospitalization status
-    filter(ind_hospitalized %in% c('0', '1')) %>%
+  study.hosp %>%
     # Update ind_hospitalized as factor
-    mutate(ind_hospitalized = as.factor(ind_hospitalized)) %>%
+    mutate(ind_hospitalized = factor(ind_hospitalized)) %>%
     mutate(description='Wider age group') %>%
-    group_by(description, age_group) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.hosp.n=sum(case=='1' & ind_hospitalized=='1'),
-      control.hosp.n=sum(case=='0' & ind_hospitalized=='1'),
-      case.hosp.p=sum(case=='1' & ind_hospitalized=='1')/sum(case=='1'),
-      control.hosp.p=sum(case=='0' & ind_hospitalized=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, as.character(ind_hospitalized))$p.value,
-      fisher.test.or=fisher.test(case, as.character(ind_hospitalized))$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, as.character(ind_hospitalized))$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, age_group) %>%
+    summarise_hosp(),
   
   # Aged 55 and above by gender
-  study %>%
-    # Remove unknow hospitalization status
-    filter(ind_hospitalized %in% c('0', '1')) %>%
+  study.hosp %>%
     # Update ind_hospitalized as factor
-    mutate(ind_hospitalized = as.factor(ind_hospitalized)) %>%
+    mutate(ind_hospitalized = factor(ind_hospitalized)) %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description, gender) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.hosp.n=sum(case=='1' & ind_hospitalized=='1'),
-      control.hosp.n=sum(case=='0' & ind_hospitalized=='1'),
-      case.hosp.p=sum(case=='1' & ind_hospitalized=='1')/sum(case=='1'),
-      control.hosp.p=sum(case=='0' & ind_hospitalized=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, as.character(ind_hospitalized))$p.value,
-      fisher.test.or=fisher.test(case, as.character(ind_hospitalized))$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, as.character(ind_hospitalized))$conf.int, collapse = '-'),
-      .groups = 'drop'),
+    group_by(description, gender) %>%
+    summarise_hosp(),
   
   # Aged 55 and above
-  study %>%
-    # Remove unknow hospitalization status
-    filter(ind_hospitalized %in% c('0', '1')) %>%
+  study.hosp %>%
     # Update ind_hospitalized as factor
-    mutate(ind_hospitalized = as.factor(ind_hospitalized)) %>%
+    mutate(ind_hospitalized = factor(ind_hospitalized)) %>%
     # Leave only patient Aged 55 and above
     filter(age >= 55) %>%
     mutate(description='Patient aged 55 and above') %>%
-    group_by(description) %>% 
-    dplyr::summarise(
-      case.n=sum(case=='1'),
-      control.n=sum(case=='0'),
-      case.hosp.n=sum(case=='1' & ind_hospitalized=='1'),
-      control.hosp.n=sum(case=='0' & ind_hospitalized=='1'),
-      case.hosp.p=sum(case=='1' & ind_hospitalized=='1')/sum(case=='1'),
-      control.hosp.p=sum(case=='0' & ind_hospitalized=='1')/sum(case=='0'),
-      fisher.test.p.value=fisher.test(case, as.character(ind_hospitalized))$p.value,
-      fisher.test.or=fisher.test(case, as.character(ind_hospitalized))$estimate,
-      fisher.test.conf.int=paste(fisher.test(case, as.character(ind_hospitalized))$conf.int, collapse = '-'),
-    .groups = 'drop')
+    group_by(description) %>%
+    summarise_hosp(),
 )
 
 anl.hosp$description <- as.factor(anl.hosp$description)
@@ -1495,6 +1710,79 @@ anl.params <- rbind(anl.params, data.frame(
   description='Rows in master with complete non-confilicted cases',
   value=nrow(data.master %>% filter(err == ''))
 ))
+
+anl.params <- rbind(anl.params, data.frame(
+  description='Duplicated conplete rows rmoved from master',
+  value=nrow(source.master) - nrow(unique.master)
+))
+
+anl.params <- rbind(anl.params, data.frame(
+  description='Duplicated conplete rows rmoved from hospitalizations',
+  value=nrow(source.hospitalizations) - nrow(unique.hospitalizations)
+))
+
+anl.params <- rbind(anl.params, data.frame(
+  description='Duplicated conplete rows rmoved from monitoring',
+  value=nrow(source.monitoring) - nrow(unique.monitoring)
+))
+
+anl.params <- rbind(anl.params, data.frame(
+  description='Duplicated conplete rows rmoved from quarantine',
+  value=nrow(source.quarantine) - nrow(unique.quarantine)
+))
+
+anl.params <- rbind(anl.params, data.frame(
+  description='Duplicated patient id with additional first_positive_result_test_date in master',
+  value=data.master %>% distinct(patient_id, first_positive_result_test_date) %>% {nrow(.) - nrow(distinct(., patient_id))}
+))
+
+anl.params <- rbind(
+  anl.params,
+  data.master %>%
+    filter(err != "") %>%
+    group_by(err) %>%
+    dplyr::summarise(value=n()) %>%
+    mutate(description=sprintf("Error in master combined: %s", err)) %>%
+    select(-err) %>%
+    bind_rows(dplyr::summarise(., description="Error in master combined total", value=sum(value)))
+)
+
+anl.params <- rbind(
+  anl.params,
+  data.master %>%
+    group_by(err) %>%
+    dplyr::summarise(value=n()) %>%
+    separate_rows(err, sep = " ") %>%
+    filter(err != "") %>%
+    group_by(err) %>%
+    dplyr::summarise(value=sum(value)) %>%
+    mutate(description=sprintf("Error in master separate: %s", err)) %>%
+    select(-err)
+)
+
+anl.params <- rbind(
+  anl.params,
+  data.hospitalizations %>%
+    filter(err != "") %>%
+    group_by(err) %>%
+    dplyr::summarise(value=n()) %>%
+    mutate(description=sprintf("Error in hospitalizations combined: %s", err)) %>%
+    select(-err) %>%
+    bind_rows(dplyr::summarise(., description="Error in hospitalizations combined total", value=sum(value)))
+)
+
+anl.params <- rbind(
+  anl.params,
+  data.hospitalizations %>%
+    group_by(err) %>%
+    dplyr::summarise(value=n()) %>%
+    separate_rows(err, sep = " ") %>%
+    filter(err != "") %>%
+    group_by(err) %>%
+    dplyr::summarise(value=sum(value)) %>%
+    mutate(description=sprintf("Error in hospitalizations separate: %s", err)) %>%
+    select(-err)
+)
 
 anl.params <- anl.params %>% mutate(description=as.factor(description))
 
@@ -1739,6 +2027,14 @@ mdl.hosp.nb.all <- study %>%
   {glm.nb(as.numeric(duration_hospitalization) ~ case * as.factor(age_group) * as.factor(gender),
                   data=.)}
 
+# Negative Binomial model with first_covid_update_medical_situation
+mdl.hosp.nb.situation <- study %>% 
+  # Remove rows with NA
+  drop_na(duration_hospitalization) %>%
+  # Make model
+  {glm.nb(as.numeric(duration_hospitalization) ~ case + as.factor(age_group) + as.factor(gender) + as.factor(ind_death) + as.factor(first_covid_update_medical_situation),
+          data=.)}
+
 # MAKE DATA FOR EXPORT ----
 #+++++++++++++++++++++++++++++
 
@@ -1782,9 +2078,13 @@ exp_df_death <- function(df){
       p.value=as.character(case_when(
         fisher.test.p.value < 0.001 ~ '<0.001',
         TRUE ~ sprintf('%.3f',fisher.test.p.value)
+      )),
+      mcnemar.p.value=as.character(case_when(
+        mcnemar.test.p.value < 0.001 ~ '<0.001',
+        TRUE ~ sprintf('%.3f',mcnemar.test.p.value)
       ))
     ) %>%
-    dplyr::select(-case.n, -case.death.n, -case.death.p, -control.n, -control.death.n, -control.death.p, -fisher.test.or, -fisher.test.p.value, -fisher.test.conf.int)
+    dplyr::select(-case.n, -case.death.n, -case.death.p, -control.n, -control.death.n, -control.death.p, -fisher.test.or, -fisher.test.p.value, -fisher.test.conf.int, -mcnemar.test.p.value)
   )
 }
 
@@ -1828,9 +2128,13 @@ exp_df_hosp <- function(df){
        p.value=as.character(case_when(
          fisher.test.p.value < 0.001 ~ '<0.001',
          TRUE ~ sprintf('%.3f',fisher.test.p.value)
+       )),
+       mcnemar.p.value=as.character(case_when(
+         mcnemar.test.p.value < 0.001 ~ '<0.001',
+         TRUE ~ sprintf('%.3f',mcnemar.test.p.value)
        ))
      ) %>%
-     dplyr::select(-case.n, -case.hosp.n, -case.hosp.p, -control.n, -control.hosp.n, -control.hosp.p, -fisher.test.or, -fisher.test.p.value, -fisher.test.conf.int)
+     dplyr::select(-case.n, -case.hosp.n, -case.hosp.p, -control.n, -control.hosp.n, -control.hosp.p, -fisher.test.or, -fisher.test.p.value, -fisher.test.conf.int, -mcnemar.test.p.value)
   )
 }
 
@@ -1892,6 +2196,14 @@ pdf(paste0(RESDIR, 'plt.survival_wgrp.pdf'))
 print(plt.survival_wgrp, newpage = FALSE)
 invisible(dev.off())
 
+pdf(paste0(RESDIR, 'plt.survival55p_situation.pdf'))
+print(plt.survival55p_situation, newpage = FALSE)
+invisible(dev.off())
+
+pdf(paste0(RESDIR, 'plt.survival55p_mild.pdf'))
+print(plt.survival55p_mild, newpage = FALSE)
+invisible(dev.off()) 
+
 pdf(paste0(RESDIR, 'plt.hosp_km.pdf'))
 print(plt.hosp_km, newpage = FALSE)
 invisible(dev.off())
@@ -1928,6 +2240,9 @@ cat("", capture.output(summary(mdl.hosp.poisson)), file = paste0(RESDIR, 'mdl.ho
 cat("", capture.output(summary(mdl.hosp.poisson.all)), file = paste0(RESDIR, 'mdl.hosp.poisson.all.txt'), sep = "\n")
 cat("", capture.output(summary(mdl.hosp.np)), file = paste0(RESDIR, 'mdl.hosp.np.txt'), sep = "\n")
 cat("", capture.output(summary(mdl.hosp.nb.all)), file = paste0(RESDIR, 'mdl.hosp.nb.all.txt'), sep = "\n")
+cat("", capture.output(summary(mdl.hosp.nb.situation)), file = paste0(RESDIR, 'mdl.hosp.nb.situation.txt'), sep = "\n")
+
+cat("", capture.output(summary(study.matched)), file = paste0(RESDIR, 'study.matched.txt'), sep = "\n")
 
 write.csv(exp.death, paste0(RESDIR, 'death.csv'), row.names = FALSE, na = "")
 write.csv(exp.death2d, paste0(RESDIR, 'death2d.csv'), row.names = FALSE, na = "")
@@ -1940,6 +2255,9 @@ write.csv(exp.demographic, paste0(RESDIR, 'demographic.csv'), row.names = FALSE,
 sink(NULL, type = "output")
 sink(NULL, type = "message")
 close(ofile)
+
+# Save sessionInfo to file
+cat("", capture.output(sessionInfo()), file = paste0(RESDIR, 'sessionInfo.txt'), sep = "\n")
 
 # Put code in file
 ofile <- file(paste0(RESDIR, 'code.R'), open = "wt")
@@ -1966,6 +2284,8 @@ plt.survival_ngrp_gen
 plt.survival_wgrp_gen
 plt.survival_ngrp
 plt.survival_wgrp
+plt.survival55p_situation
+plt.survival55p_mild
 plt.hosp_km
 plt.hosp_km55p
 plt.hosp_km65p
@@ -1979,10 +2299,11 @@ summary(mdl.hosp.poisson)
 summary(mdl.hosp.poisson.all)
 summary(mdl.hosp.np)
 summary(mdl.hosp.nb.all)
+summary(mdl.hosp.nb.situation)
 
-View(anl.death)
-View(anl.death2d)
-View(anl.death2t5d)
-View(anl.hosp)
-View(anl.params)
-View(anl.demographic)
+View(exp.death)
+View(exp.death2d)
+View(exp.death2t5d)
+View(exp.hosp)
+View(exp.params)
+View(exp.demographic)
