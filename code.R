@@ -4,7 +4,6 @@
 
 MATCH_ADMSTAT = TRUE
 
-# TODO
 # Un-Comment to remove admission status from match
 #MATCH_ADMSTAT = FALSE
 
@@ -265,7 +264,6 @@ data.hospitalizations <- data.hospitalizations %>%
     data.master[data.master$err == '',c('patient_id', 'first_positive_result_test_date')],
     by = 'patient_id', all.x = TRUE, all.y = FALSE
   ) %>%
-  # TODO split so it'll be more readable.
   # Error if first_positive_result_test_date - deathdate < STUDY_MIN_TO_DEATH days
   mutate(
     err = case_when(
@@ -297,7 +295,6 @@ data.comb <- data.master %>%
 
 # Generate table with death dates for all patient who die from corona (in hospital)
 tmp.hospitalizations.deathdate <- data.hospitalizations %>%
-  # TODO change to only if include 'deathdate' instead of twice.
   # Remove errors
   filter(!grepl('.* diff_deathdate.*|.* deathdate_first_positive_result_test_date.*', err)) %>%
   # Select the relevant columns
@@ -387,7 +384,6 @@ data.comb <- data.comb %>%
 ## hospitalization indication ----
 #.............................
 
-# TODO maybe take max so if patient have at least one correct hospitalization he'll indicated as hospitalized.
 # Generate table with indication for hospitalization for corona
 tmp.hospitalizations.ind <- tmp.hospitalizations %>%
   # Create hospitalization indication: -1 on error and 1 if hospitalized
@@ -613,7 +609,6 @@ study.pre.match <- data.comb %>%
   filter(between(first_positive_result_test_date, as.Date(STUDY_START), as.Date(STUDY_END))) %>%
   # Leave only patients aged STUDY_MIN_AGE and above
   filter(STUDY_MIN_AGE <= age) %>%
-  # TODO ASK Remove
   # Filter PCR_during_hospitalization_ind
   filter(PCR_during_hospitalization_ind == "0") %>%
   # filter all error in hospitaliztion indicate as -1 or hospitalization_unknown
@@ -765,16 +760,6 @@ plt.days_first_positive_result_to_hospitalization_study <- study %>%
       ylab("Counts") +
       facet_grid(case ~ .) +
       theme(strip.text.y =element_blank())}
-
-# # compare distribiutens of first situation in hospitalization between patient diagnosed in hospital compare to previusely diagnosed  
-# plt.first_situation_in_hospitalization <- study %>%
-#   mutate(
-#     # Add different group (-2 to 0 and 1-21) indication column
-#     case = as.factor(case_when(
-#       days_first_positive_result_to_hospitalization > '1' ~ '1',
-#       days_first_positive_result_to_hospitalization < '0' ~ '0'))) %>%
-  
-
 
 ## Death ----
 #.............................
@@ -1257,13 +1242,6 @@ plt.survival_wgrp <- study.survival %>%
 # Aged 55 and above by first_covid_update_medical_situation
 
 plt.survival55p_situation <- study.survival %>%
-  # TODO ASK if combine conditions 
-  # mutate(first_covid_update_medical_situation=factor(case_when(
-  #   first_covid_update_medical_situation == 'moderate' ~ 'moderate_severe_critical',
-  #   first_covid_update_medical_situation == 'severe' ~ 'moderate_severe_critical',
-  #   first_covid_update_medical_situation == 'critical' ~ 'moderate_severe_critical',
-  #   TRUE ~ as.character(first_covid_update_medical_situation)
-  # ))) %>%
   # Leave only patient Aged 55 and above
   filter(age >= 55) %>%
   # drop unused levels from factors after filterin
@@ -1283,7 +1261,6 @@ plt.survival55p_situation <- study.survival %>%
     legend.title = "",
     legend.labs = c("Unvaccinated", "Recently injected"),
     pval=TRUE,
-    # TODO
     # pval.coord = c(1,0.65),
     # ylim=c(0.6,1.01),
     axes.offset = FALSE,
